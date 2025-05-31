@@ -2,13 +2,8 @@ import inspect
 import io
 import os
 import sys
-import asyncio
-# if sys.platform.startswith("win"):
-    # # Use the selector event loop to avoid Proactor pipe-shutdown errors
-    # asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import re
 os.environ['HF_HOME'] = os.path.abspath(os.path.realpath(os.path.join(os.path.dirname(__file__), './hf_download')))
-
 from diffusers_helper.hf_login import login
 import json
 import traceback
@@ -18,18 +13,17 @@ import uuid
 import configparser
 import ast
 import random
-import gradio as gr
-import torch
+import gradio as gr # type: ignore
+import torch # type: ignore
 import traceback
-import einops
-import safetensors.torch as sf
-# from safetensors.torch import load_file as load_safetensors
-from safetensors.torch import load_file
-import numpy as np
+import einops # type: ignore
+import safetensors.torch as sf # type: ignore
+from safetensors.torch import load_file # type: ignore
+import numpy as np # type: ignore
 import argparse
 import math
-from PIL import Image, ImageDraw, ImageFont
-from PIL.PngImagePlugin import PngInfo
+from PIL import Image, ImageDraw, ImageFont # type: ignore
+from PIL.PngImagePlugin import PngInfo # type: ignore
 from diffusers_helper.hunyuan import encode_prompt_conds, vae_decode, vae_encode, vae_decode_fake
 from diffusers_helper.utils import save_bcthw_as_mp4, crop_or_pad_yield_mask, soft_append_bcthw, resize_and_center_crop, state_dict_weighted_merge, state_dict_offset_merge, generate_timestamp
 from diffusers_helper.models.hunyuan_video_packed import HunyuanVideoTransformer3DModelPacked
@@ -39,18 +33,20 @@ from diffusers_helper.thread_utils import AsyncStream, async_run
 from diffusers_helper.gradio.progress_bar import make_progress_bar_css, make_progress_bar_html
 from diffusers_helper.clip_vision import hf_clip_vision_encode
 from diffusers_helper.bucket_tools import find_nearest_bucket
-from diffusers.utils import load_image
-from diffusers import AutoencoderKLHunyuanVideo
-from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer
-from transformers import SiglipImageProcessor, SiglipVisionModel
+from diffusers.utils import load_image # type: ignore
+from diffusers import AutoencoderKLHunyuanVideo # type: ignore
+from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer # type: ignore
+from transformers import SiglipImageProcessor, SiglipVisionModel # type: ignore
 import shutil
-import cv2
+import cv2 # type: ignore
 import subprocess
 import datetime
 import math
 from tqdm import tqdm
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, HfApi, snapshot_download # type: ignore
 import gc
+import time
+
 
 # ANSI color codes
 YELLOW = '\033[93m'
@@ -147,7 +143,7 @@ def ensure_ffmpeg():
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install", "imageio_ffmpeg"])
             print("Successfully installed imageio_ffmpeg")
-            import imageio_ffmpeg
+            import imageio_ffmpeg # type: ignore
             ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
             if ffmpeg_path and os.path.exists(ffmpeg_path):
                 ffmpeg_dir = os.path.dirname(ffmpeg_path)
@@ -165,13 +161,13 @@ ensure_ffmpeg()
 def ensure_peft():
     try:
         # try to import PEFT
-        from peft import PeftModel, PeftConfig
+        from peft import PeftModel, PeftConfig # type: ignore
         return PeftModel, PeftConfig
     except ImportError:
         # install it into this Python environment
         subprocess.check_call([sys.executable, "-m", "pip", "install", "peft"])
         # now retry the import
-        from peft import PeftModel, PeftConfig
+        from peft import PeftModel, PeftConfig # type: ignore
         return PeftModel, PeftConfig
 
 PeftModel, PeftConfig = ensure_peft()
@@ -352,7 +348,6 @@ def download_model_from_huggingface(model_id):
             debug_print(f"Downloading model {model_id}...")
             try:
                 # First check if we can access the model
-                from huggingface_hub import HfApi
                 api = HfApi()
                 try:
                     # Try to get model info first
@@ -779,7 +774,6 @@ def get_available_models(include_online=False):
     if include_online:
         debug_print("Online models requested, starting online search...")
         try:
-            from huggingface_hub import HfApi
             
             # Get token from Config and set in environment
             token = Config._instance.HF_TOKEN if Config._instance else Config.HF_TOKEN
@@ -2776,7 +2770,9 @@ def mark_job_completed(completed_job):
         os.remove(completed_job.thumbnail)
     mp4_path = os.path.join(Config.OUTPUTS_FOLDER, f"{completed_job.job_name}.mp4")
     extract_thumb_from_processing_mp4(completed_job, mp4_path, job_percentage = 100)
-    completed_job.thumbnail = create_thumbnail(completed_job, status_change=True)
+    completed_job.thumbnail = thumbnail
+    if completed_job.image_path != "text2video":
+        completed_job.thumbnail = create_thumbnail(completed_job, status_change=True)
     save_queue()
     return update_queue_table(), update_queue_display()
 
@@ -2914,14 +2910,14 @@ def make_img2img(worker_input_image, next_job, worker_prompt, worker_cfg, worker
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
 
+        state_dict = transformer.state_dict()
 
         # Load LoRA if set
         if next_job.lora_model and next_job.lora_model != "None":
             try:
                 lora_model = os.path.join(lora_path, next_job.lora_model)
                 debug_print(f"Loading hunyaun videoLoRA from {lora_model}")
-                
-                state_dict = load_lora(state_dict, lora_model, worker_lora_weight, device=gpu)
+                state_dict = load_lora(state_dict, lora_model, next_job.lora_weight, device=gpu)
                 gc.collect()
                 debug_print("LoRA loaded successfully")
             except Exception as e:
@@ -3819,7 +3815,7 @@ def extract_thumb_from_processing_mp4(job, mp4_path, job_percentage):
             cv2.imwrite(thumb_path, thumb)
         cap.release()
         debug_print (f"extracted thumb from {mp4_path}")    
-    return(job, mp4_path)
+    return(job, thumb_path)
 
 def process():
     global stream
@@ -4846,8 +4842,9 @@ def edit_job(
                     job.change_job_name = change_job_name
                     change_job_name = generate_new_job_name(job.change_job_name)
                     new_image_path = os.path.join(temp_queue_images, f"queue_image_{change_job_name}.png")
-                    shutil.copy2(job.image_path, new_image_path)
-                    job.image_path = new_image_path
+                    if job.image_path != "text2video":
+                        shutil.copy2(job.image_path, new_image_path)
+                        job.image_path = new_image_path
                     job.job_name = change_job_name
                     job.change_job_name = None
                     save_queue()
@@ -5772,12 +5769,6 @@ with block:
                         info="Strength of the LoRA. 0 disables it."
                     )
 
-                
-                # with gr.Accordion("Lora Settings", open=False):
-                    # edit_metadata_job_lora_model = gr.Dropdown(label="LoRA Model", choices=lora_choices, value=Config.DEFAULT_LORA_MODEL, info="Select a LoRA .safetensors file to use (or None for no LoRA)")
-                    # edit_metadata_job_lora_weight = gr.Slider(label="LoRA Strength", minimum=0, maximum=2.0, value=Config.DEFAULT_LORA_WEIGHT, step=0.1)
-                # gr.Markdown("<br>")
-
 
                 with gr.Accordion("Job Settings", open=False):
                     edit_metadata_job_use_teacache = gr.Checkbox(label='Change Use TeaCache', value=True)
@@ -6027,7 +6018,6 @@ with block:
                                     
                                     if not os.path.exists(model_path):
                                         try:
-                                            from huggingface_hub import snapshot_download
                                             snapshot_download(repo_id=model_name, local_dir=model_path)
                                             debug_print(f"Downloaded model {model_name} to {model_path}")
                                             # Update dropdown choices
