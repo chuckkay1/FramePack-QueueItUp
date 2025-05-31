@@ -13,8 +13,9 @@ NEW CONDA INSTALL Standalone Version
 
    ```bash
    git clone -b dev https://github.com/chuckkay/QueueItUp_FramePack.git
-   
-   
+
+   conda create --name FramePack_QueueItUp python=3.12 pip=25.0
+
    cd QueueItUp_FramePack
    
    
