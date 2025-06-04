@@ -8,7 +8,7 @@ from diffusers_helper.hf_login import login
 import json
 import traceback
 from dataclasses import dataclass, asdict
-from typing import Optional
+from typing import List, Optional
 import uuid
 import configparser
 import ast
@@ -37,6 +37,7 @@ from diffusers.utils import load_image # type: ignore
 from diffusers import AutoencoderKLHunyuanVideo # type: ignore
 from transformers import LlamaModel, CLIPTextModel, LlamaTokenizerFast, CLIPTokenizer # type: ignore
 from transformers import SiglipImageProcessor, SiglipVisionModel # type: ignore
+from peft import PeftModel, PeftConfig # type: ignore
 import shutil
 import cv2 # type: ignore
 import subprocess
@@ -139,19 +140,13 @@ def ensure_ffmpeg():
             print("FFmpeg is already installed and available")
             return True
     except FileNotFoundError:
-        print("FFmpeg not found, attempting to install imageio_ffmpeg...")
+        print("FFmpeg not found, attempting to install ffmpeg...")
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "imageio_ffmpeg"])
-            print("Successfully installed imageio_ffmpeg")
-            import imageio_ffmpeg # type: ignore
-            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-            if ffmpeg_path and os.path.exists(ffmpeg_path):
-                ffmpeg_dir = os.path.dirname(ffmpeg_path)
-                os.environ['PATH'] = ffmpeg_dir + os.pathsep + os.environ['PATH']
-                print(f"Added FFmpeg to PATH: {ffmpeg_dir}")
-                return True
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "ffmpeg"])
+            print("Successfully installed ffmpeg")
+            import ffmpeg # type: ignore
         except Exception as e:
-            print(f"Error installing imageio_ffmpeg: {str(e)}")
+            print(f"Error installing ffmpeg: {str(e)}")
             return False
     return True
 
@@ -428,235 +423,151 @@ def download_model_from_huggingface(model_id):
 
 
 
+@dataclass
+class PromptSection:
+    """Represents a section of the prompt with specific timing information"""
+    prompt: str
+    start_time: float = 0  # in seconds
+    end_time: Optional[float] = None  # in seconds, None means until the end
 
-def load_lora(
-    state_dict: dict[str, torch.Tensor], lora_model: str, lora_weight: float, device: torch.device
-) -> dict[str, torch.Tensor]:
+
+def snap_to_section_boundaries(prompt_sections: List[PromptSection], latent_window_size: int, fps: int = 30) -> List[PromptSection]:
     """
-    Merge LoRA weights into the state dict of a model.
+    Adjust timestamps to align with model's internal section boundaries
+    
+    Args:
+        prompt_sections: List of PromptSection objects
+        latent_window_size: Size of the latent window used in the model
+        fps: Frames per second (default: 30)
+        
+    Returns:
+        List of PromptSection objects with aligned timestamps
     """
-    lora_sd = load_file(lora_model)
-
-    # Check the format of the LoRA file
-    keys = list(lora_sd.keys())
-    if keys[0].startswith("lora_unet_"):
-        info_print(f"Musubi Tuner LoRA detected")
-        return merge_musubi_tuner(lora_sd, state_dict, lora_weight, device)
-
-    transformer_prefixes = ["diffusion_model", "transformer"]  # to ignore Text Encoder modules
-    lora_suffix = None
-    prefix = None
-    for key in keys:
-        if lora_suffix is None and "lora_A" in key:
-            lora_suffix = "lora_A"
-        if prefix is None:
-            pfx = key.split(".")[0]
-            if pfx in transformer_prefixes:
-                prefix = pfx
-        if lora_suffix is not None and prefix is not None:
-            break
-
-    if lora_suffix == "lora_A" and prefix is not None:
-        success_print(f"Diffusion-pipe (?) LoRA detected")
-        return merge_diffusion_pipe_or_something(lora_sd, state_dict, "lora_unet_", lora_weight, device)
-
-    alert_print(f"LoRA file format not recognized: {os.path.basename(lora_model)}")
-    return state_dict
+    section_duration = (latent_window_size * 4 - 3) / fps  # Duration of one section in seconds
+    
+    aligned_sections = []
+    for section in prompt_sections:
+        # Snap start time to nearest section boundary
+        aligned_start = round(section.start_time / section_duration) * section_duration
+        
+        # Snap end time to nearest section boundary
+        aligned_end = None
+        if section.end_time is not None:
+            aligned_end = round(section.end_time / section_duration) * section_duration
+        
+        # Ensure minimum section length
+        if aligned_end is not None and aligned_end <= aligned_start:
+            aligned_end = aligned_start + section_duration
+            
+        aligned_sections.append(PromptSection(
+            prompt=section.prompt,
+            start_time=aligned_start,
+            end_time=aligned_end
+        ))
+    
+    return aligned_sections
 
 
-def merge_diffusion_pipe_or_something(
-    lora_sd: dict[str, torch.Tensor], state_dict: dict[str, torch.Tensor], prefix: str, lora_weight: float, device: torch.device
-) -> dict[str, torch.Tensor]:
+def parse_timestamped_prompt(prompt_text: str, total_duration: float, latent_window_size: int = 9, generation_type: str = "Original") -> List[PromptSection]:
     """
-    Convert LoRA weights to the format used by the diffusion pipeline to Musubi Tuner.
-    Copy from Musubi Tuner repo.
+    Parse a prompt with timestamps in the format [0s-2s: text] or [3s: text]
+    
+    Args:
+        prompt_text: The input prompt text with optional timestamp sections
+        total_duration: Total duration of the video in seconds
+        latent_window_size: Size of the latent window used in the model
+        generation_type: Type of generation ("Original" or "F1")
+        
+    Returns:
+        List of PromptSection objects with timestamps aligned to section boundaries
+        and reversed to account for reverse generation (only for Original type)
     """
-    # convert from diffusers(?) to default LoRA
-    # Diffusers format: {"diffusion_model.module.name.lora_A.weight": weight, "diffusion_model.module.name.lora_B.weight": weight, ...}
-    # default LoRA format: {"prefix_module_name.lora_down.weight": weight, "prefix_module_name.lora_up.weight": weight, ...}
+    # Default prompt for the entire duration if no timestamps are found
+    if "[" not in prompt_text or "]" not in prompt_text:
+        return [PromptSection(prompt=prompt_text.strip())]
+    
+    sections = []
+    # Find all timestamp sections [time: text]
+    timestamp_pattern = r'\[(\d+(?:\.\d+)?s)(?:-(\d+(?:\.\d+)?s))?\s*:\s*(.*?)\]'
+    regular_text = prompt_text
+    
+    for match in re.finditer(timestamp_pattern, prompt_text):
+        start_time_str = match.group(1)
+        end_time_str = match.group(2)
+        section_text = match.group(3).strip()
+        
+        # Convert time strings to seconds
+        start_time = float(start_time_str.rstrip('s'))
+        end_time = float(end_time_str.rstrip('s')) if end_time_str else None
+        
+        sections.append(PromptSection(
+            prompt=section_text,
+            start_time=start_time,
+            end_time=end_time
+        ))
+        
+        # Remove the processed section from regular_text
+        regular_text = regular_text.replace(match.group(0), "")
+    
+    # If there's any text outside of timestamp sections, use it as a default for the entire duration
+    regular_text = regular_text.strip()
+    if regular_text:
+        sections.append(PromptSection(
+            prompt=regular_text,
+            start_time=0,
+            end_time=None
+        ))
+    
+    # Sort sections by start time
+    sections.sort(key=lambda x: x.start_time)
+    
+    # Fill in end times if not specified
+    for i in range(len(sections) - 1):
+        if sections[i].end_time is None:
+            sections[i].end_time = sections[i+1].start_time
+    
+    # Set the last section's end time to the total duration if not specified
+    if sections and sections[-1].end_time is None:
+        sections[-1].end_time = total_duration
+    
+    # Snap timestamps to section boundaries
+    sections = snap_to_section_boundaries(sections, latent_window_size)
+    
+    # Only reverse timestamps for Original generation type
+    if generation_type in ("Original", "Original with Endframe"):
+        # Now reverse the timestamps to account for reverse generation
+        reversed_sections = []
+        for section in sections:
+            reversed_start = total_duration - section.end_time if section.end_time is not None else 0
+            reversed_end = total_duration - section.start_time
+            reversed_sections.append(PromptSection(
+                prompt=section.prompt,
+                start_time=reversed_start,
+                end_time=reversed_end
+            ))
+        
+        # Sort the reversed sections by start time
+        reversed_sections.sort(key=lambda x: x.start_time)
+        return reversed_sections
+    
+    return sections
 
-    # note: Diffusers has no alpha, so alpha is set to rank
-    new_weights_sd = {}
-    lora_dims = {}
-    for key, weight in lora_sd.items():
-        diffusers_prefix, key_body = key.split(".", 1)
-        if diffusers_prefix != "diffusion_model" and diffusers_prefix != "transformer":
-            print(f"unexpected key: {key} in diffusers format")
-            continue
 
-        new_key = f"{prefix}{key_body}".replace(".", "_").replace("_lora_A_", ".lora_down.").replace("_lora_B_", ".lora_up.")
-        new_weights_sd[new_key] = weight
-
-        lora_name = new_key.split(".")[0]  # before first dot
-        if lora_name not in lora_dims and "lora_down" in new_key:
-            lora_dims[lora_name] = weight.shape[0]
-
-    # add alpha with rank
-    for lora_name, dim in lora_dims.items():
-        new_weights_sd[f"{lora_name}.alpha"] = torch.tensor(dim)
-
-    return merge_musubi_tuner(new_weights_sd, state_dict, lora_weight, device)
-
-
-def merge_musubi_tuner(
-    lora_sd: dict[str, torch.Tensor], state_dict: dict[str, torch.Tensor], lora_weight: float, device: torch.device
-) -> dict[str, torch.Tensor]:
+def get_section_boundaries(latent_window_size: int = 9, count: int = 10) -> str:
     """
-    Merge LoRA weights into the state dict of a model.
+    Calculate and format section boundaries for UI display
+    
+    Args:
+        latent_window_size: Size of the latent window used in the model
+        count: Number of boundaries to display
+        
+    Returns:
+        Formatted string of section boundaries
     """
-    # Check LoRA is for FramePack or for HunyuanVideo
-    is_hunyuan = False
-    for key in lora_sd.keys():
-        if "double_blocks" in key or "single_blocks" in key:
-            is_hunyuan = True
-            break
-    if is_hunyuan:
-        success_print("HunyuanVideo LoRA detected, converting to FramePack format")
-        lora_sd = convert_hunyuan_to_framepack(lora_sd)
-
-    # Merge LoRA weights into the state dict
-    success_print(f"Merging LoRA weights into state dict. lora_weight: {lora_weight}")
-
-    # Create module map
-    name_to_original_key = {}
-    for key in state_dict.keys():
-        if key.endswith(".weight"):
-            lora_name = key.rsplit(".", 1)[0]  # remove trailing ".weight"
-            lora_name = "lora_unet_" + lora_name.replace(".", "_")
-            if lora_name not in name_to_original_key:
-                name_to_original_key[lora_name] = key
-
-    # Merge LoRA weights
-    keys = list([k for k in lora_sd.keys() if "lora_down" in k])
-    for key in tqdm(keys, desc="Merging LoRA weights"):
-        up_key = key.replace("lora_down", "lora_up")
-        alpha_key = key[: key.index("lora_down")] + "alpha"
-
-        # find original key for this lora
-        module_name = ".".join(key.split(".")[:-2])  # remove trailing ".lora_down.weight"
-        if module_name not in name_to_original_key:
-            debug_print(f"No module found for LoRA weight: {key}")
-            continue
-
-        original_key = name_to_original_key[module_name]
-
-        down_weight = lora_sd[key]
-        up_weight = lora_sd[up_key]
-
-        dim = down_weight.size()[0]
-        alpha = lora_sd.get(alpha_key, dim)
-        scale = alpha / dim
-
-        weight = state_dict[original_key]
-        original_device = weight.device
-        if original_device != device:
-            weight = weight.to(device)  # to make calculation faster
-
-        down_weight = down_weight.to(device)
-        up_weight = up_weight.to(device)
-
-        # W <- W + U * D
-        if len(weight.size()) == 2:
-            # linear
-            if len(up_weight.size()) == 4:  # use linear projection mismatch
-                up_weight = up_weight.squeeze(3).squeeze(2)
-                down_weight = down_weight.squeeze(3).squeeze(2)
-            weight = weight + lora_weight * (up_weight @ down_weight) * scale
-        elif down_weight.size()[2:4] == (1, 1):
-            # conv2d 1x1
-            weight = (
-                weight
-                + lora_weight
-                * (up_weight.squeeze(3).squeeze(2) @ down_weight.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
-                * scale
-            )
-        else:
-            # conv2d 3x3
-            conved = torch.nn.functional.conv2d(down_weight.permute(1, 0, 2, 3), up_weight).permute(1, 0, 2, 3)
-            # logger.info(conved.size(), weight.size(), module.stride, module.padding)
-            weight = weight + lora_weight * conved * scale
-
-        weight = weight.to(original_device)  # move back to original device
-        state_dict[original_key] = weight
-
-    return state_dict
+    section_duration = (latent_window_size * 4 - 3) / 30
+    return ", ".join([f"{i*section_duration:.1f}s" for i in range(count)])
 
 
-def convert_hunyuan_to_framepack(lora_sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """
-    Convert HunyuanVideo LoRA weights to FramePack format.
-    """
-    new_lora_sd = {}
-    for key, weight in lora_sd.items():
-        if "double_blocks" in key:
-            key = key.replace("double_blocks", "transformer_blocks")
-            key = key.replace("img_mod_linear", "norm1_linear")
-            key = key.replace("img_attn_qkv", "attn_to_QKV")  # split later
-            key = key.replace("img_attn_proj", "attn_to_out_0")
-            key = key.replace("img_mlp_fc1", "ff_net_0_proj")
-            key = key.replace("img_mlp_fc2", "ff_net_2")
-            key = key.replace("txt_mod_linear", "norm1_context_linear")
-            key = key.replace("txt_attn_qkv", "attn_add_QKV_proj")  # split later
-            key = key.replace("txt_attn_proj", "attn_to_add_out")
-            key = key.replace("txt_mlp_fc1", "ff_context_net_0_proj")
-            key = key.replace("txt_mlp_fc2", "ff_context_net_2")
-        elif "single_blocks" in key:
-            key = key.replace("single_blocks", "single_transformer_blocks")
-            key = key.replace("linear1", "attn_to_QKVM")  # split later
-            key = key.replace("linear2", "proj_out")
-            key = key.replace("modulation_linear", "norm_linear")
-        else:
-            print(f"Unsupported module name: {key}, only double_blocks and single_blocks are supported")
-            continue
-
-        if "QKVM" in key:
-            # split QKVM into Q, K, V, M
-            key_q = key.replace("QKVM", "q")
-            key_k = key.replace("QKVM", "k")
-            key_v = key.replace("QKVM", "v")
-            key_m = key.replace("attn_to_QKVM", "proj_mlp")
-            if "_down" in key or "alpha" in key:
-                # copy QKVM weight or alpha to Q, K, V, M
-                assert "alpha" in key or weight.size(1) == 3072, f"QKVM weight size mismatch: {key}. {weight.size()}"
-                new_lora_sd[key_q] = weight
-                new_lora_sd[key_k] = weight
-                new_lora_sd[key_v] = weight
-                new_lora_sd[key_m] = weight
-            elif "_up" in key:
-                # split QKVM weight into Q, K, V, M
-                assert weight.size(0) == 21504, f"QKVM weight size mismatch: {key}. {weight.size()}"
-                new_lora_sd[key_q] = weight[:3072]
-                new_lora_sd[key_k] = weight[3072 : 3072 * 2]
-                new_lora_sd[key_v] = weight[3072 * 2 : 3072 * 3]
-                new_lora_sd[key_m] = weight[3072 * 3 :]  # 21504 - 3072 * 3 = 12288
-            else:
-                print(f"Unsupported module name: {key}")
-                continue
-        elif "QKV" in key:
-            # split QKV into Q, K, V
-            key_q = key.replace("QKV", "q")
-            key_k = key.replace("QKV", "k")
-            key_v = key.replace("QKV", "v")
-            if "_down" in key or "alpha" in key:
-                # copy QKV weight or alpha to Q, K, V
-                assert "alpha" in key or weight.size(1) == 3072, f"QKV weight size mismatch: {key}. {weight.size()}"
-                new_lora_sd[key_q] = weight
-                new_lora_sd[key_k] = weight
-                new_lora_sd[key_v] = weight
-            elif "_up" in key:
-                # split QKV weight into Q, K, V
-                assert weight.size(0) == 3072 * 3, f"QKV weight size mismatch: {key}. {weight.size()}"
-                new_lora_sd[key_q] = weight[:3072]
-                new_lora_sd[key_k] = weight[3072 : 3072 * 2]
-                new_lora_sd[key_v] = weight[3072 * 2 :]
-            else:
-                print(f"Unsupported module name: {key}")
-                continue
-        else:
-            # no split needed
-            new_lora_sd[key] = weight
-
-    return new_lora_sd
 
 
 
@@ -1391,7 +1302,7 @@ def load_settings():
             
         # Check and add any missing model values
         for key, value in default_values.items():
-            if key.startswith('DEFAULT_') and any(model_type in key.lower() for model_type in ['transformer', 'text_encoder', 'tokenizer', 'vae', 'feature_extractor', 'image_encoder']):
+            if key.startswith('DEFAULT_') and any(model_type in key.lower() for model_type in ['transformer', 'text_encoder', 'tokenizer', 'vae', 'feature_extractor', 'image_encoder', 'image2image_model']):
                 if key not in config['Model Defaults']:
                     config['Model Defaults'][key] = repr(value)
         
@@ -1807,6 +1718,7 @@ def save_image_to_temp(image: np.ndarray, job_name: str) -> str:
         return ""
 
 def add_to_queue(prompt, n_prompt, lora_model, lora_weight, input_image, video_length, job_name, create_job_outputs_folder, create_job_history_folder, use_teacache, seed, steps, cfg, gs, rs, image_strength, mp4_crf, gpu_memory, create_job_keep_completed_job, keep_temp_png, status="pending", source_name=""):
+    load_queue()
     """Add a new job to the queue"""
     try:
         # Ensure lora_model is always a string
@@ -2042,12 +1954,13 @@ thumbnail_captions = {}
 
 def update_queue_display():
     global thumbnail_captions
+    load_queue()
     try:
         queue_data = []
         thumbnail_captions = {}
         for job in job_queue:
             # Only check for missing images if the job is not being deleted
-            if job.status != "deleting":
+            if job.status != "completed":
                 # Check if both queue image and thumbnail are missing
                 queue_image_missing = not os.path.exists(job.image_path) if job.image_path else True
                 thumbnail_missing = not os.path.exists(job.thumbnail) if job.thumbnail else True
@@ -2056,10 +1969,10 @@ def update_queue_display():
                 elif not job.thumbnail and job.image_path:
                     job.thumbnail = create_thumbnail(job, status_change=False)
 
-            if job.thumbnail:
-                caption = f"{job.prompt} \n Negative: {job.n_prompt} \n Lora: {job.lora_model}\nLength: {job.video_length}s\nGS: {job.gs}"
-                thumbnail_captions[job.thumbnail] = caption
-                queue_data.append(job.thumbnail)
+                if job.thumbnail:
+                    caption = f"{job.prompt} \n Negative: {job.n_prompt} \n Lora: {job.lora_model}\nLength: {job.video_length}s\nGS: {job.gs}"
+                    thumbnail_captions[job.thumbnail] = caption
+                    queue_data.append(job.thumbnail)
         current_counts = count_jobs_by_status()
         return gr.update(value=queue_data, label=f"{current_counts['pending']} Jobs pending in the Queue")
     except Exception as e:
@@ -2394,7 +2307,7 @@ def delete_quick_prompt(prompt_text):
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
-parser.add_argument("--server", type=str, default='0.0.0.0')
+parser.add_argument("--server", type=str, default='127.0.0.1')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
 args = parser.parse_args()
@@ -2770,7 +2683,6 @@ def mark_job_completed(completed_job):
         os.remove(completed_job.thumbnail)
     mp4_path = os.path.join(Config.OUTPUTS_FOLDER, f"{completed_job.job_name}.mp4")
     extract_thumb_from_processing_mp4(completed_job, mp4_path, job_percentage = 100)
-    completed_job.thumbnail = thumbnail
     if completed_job.image_path != "text2video":
         completed_job.thumbnail = create_thumbnail(completed_job, status_change=True)
     save_queue()
@@ -2822,6 +2734,31 @@ def mark_job_pending(job):
         traceback.print_exc()
         return gr.update(), gr.update()
 
+
+# Function to load a LoRA file
+def load_lora(
+    state_dict: dict[str, torch.Tensor], lora_model: str, lora_weight: float, device: torch.device
+) -> dict[str, torch.Tensor]:
+    """
+    Load and apply LoRA weights directly from .safetensors file.
+    """
+    if not lora_model or lora_model.lower() == "none":
+        return state_dict
+
+    try:
+        # Load the LoRA weights directly from .safetensors
+        lora_sd = load_file(lora_model)
+        
+        # Apply the LoRA weights to the state dict
+        for key in state_dict:
+            if key in lora_sd:
+                state_dict[key] = state_dict[key] + lora_sd[key] * lora_weight
+        
+        return state_dict
+
+    except Exception as e:
+        alert_print(f"Error loading LoRA: {str(e)}")
+        return state_dict
 
 @torch.no_grad()
 def make_img2img(worker_input_image, next_job, worker_prompt, worker_cfg, worker_n_prompt, 
@@ -2910,16 +2847,12 @@ def make_img2img(worker_input_image, next_job, worker_prompt, worker_cfg, worker
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
         image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
 
-        state_dict = transformer.state_dict()
-
-        # Load LoRA if set
-        if next_job.lora_model and next_job.lora_model != "None":
+        if next_job.lora_model and next_job.lora_model.lower() != "none":
             try:
                 lora_model = os.path.join(lora_path, next_job.lora_model)
-                debug_print(f"Loading hunyaun videoLoRA from {lora_model}")
-                state_dict = load_lora(state_dict, lora_model, next_job.lora_weight, device=gpu)
-                gc.collect()
-                debug_print("LoRA loaded successfully")
+                info_print(f"Loading LoRA from {lora_model}")
+                transformer.load_state_dict(load_lora(transformer.state_dict(), lora_model, next_job.lora_weight, gpu))
+                success_print("LoRA loaded successfully")
             except Exception as e:
                 alert_print(f"Error loading LoRA: {str(e)}")
                 traceback.print_exc()
@@ -3057,102 +2990,10 @@ def make_img2img(worker_input_image, next_job, worker_prompt, worker_cfg, worker
         return new_input_image, starting_image
 
 
-            # # # Initialize RealESRGAN if available
-            # # dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            # # rrgan = None
-            # # if ensure_package('realesrgan'):
-                # # from realesrgan import RealESRGAN
-                # # try:
-                    # # rrgan = RealESRGAN(dev, scale=2)
-                    # # rrgan.load_weights('RealESRGAN_x2plus')
-                    # # print("DEBUG: RealESRGAN ready for enhancement")
-                # # except Exception as e:
-                    # # print(f"WARNING: RealESRGAN init/load error ({e}); skipping super-resolution.")
-                    # # rrgan = None
-            # # else:
-                # # rrgan = None
-
-            # # # ... inside your processing loop ...
-            # if ret:
-                # # 1) Convert BGR -> RGB and create PIL image
-                # output_rgb = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
-                # pil_img = Image.fromarray(output_rgb)
-
-                # # 2) Save original 'before' image
-                # before_path = os.path.join(temp_queue_images, f"before_image_{worker_job_name}.png")
-                # pil_img.save(before_path)
-                # print(f"DEBUG: Saved before-image: {before_path}")
-
-                # orig_size = pil_img.size
-
-                # # SECTION 3: OpenCV DENOISE PASS
-                # print("DEBUG [Section 3]: Starting OpenCV denoising...")
-                # try:
-                    # proc_np = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-                    # denoised_np = cv2.fastNlMeansDenoisingColored(
-                        # proc_np, None,
-                        # h=30, hColor=30,
-                        # templateWindowSize=7,
-                        # searchWindowSize=21
-                    # )
-                    # denoised_img = Image.fromarray(cv2.cvtColor(denoised_np, cv2.COLOR_BGR2RGB))
-                    # print("DEBUG [Section 3]: OpenCV denoising applied successfully")
-                # except Exception as e:
-                    # print(f"ERROR [Section 3]: OpenCV denoise failed ({e})")
-                    # denoised_img = pil_img
-                # # ─── Section 4: Super-resolution enhancement ───
-                # try:
-                    # # dynamic import only when needed
-                    # import importlib
-                    # rr_module = importlib.import_module("realesrgan")
-                    # RealESRGAN = getattr(rr_module, "RealESRGAN")
-                    # print("DEBUG: RealESRGAN imported successfully")
-
-                    # # initialize and load weights
-                    # rrgan = RealESRGAN(device="cuda", scale=2)
-                    # rrgan.load_weights("RealESRGAN_x2plus")
-                    # print("DEBUG: RealESRGAN weights loaded")
-
-                    # # run enhancement on the denoised or original PIL image
-                    # enhanced_large = rrgan.enhance(pil_img)
-                    # enhanced_large.save(os.path.join(temp_queue_images, f"enhanced_large_{worker_job_name}.png"))
-                    # print("DEBUG: Saved enhanced_large file")
-
-                    # # resize back to original size and overwrite new_input_image
-                    # restored = enhanced_large.resize(orig_size, resample=Image.LANCZOS)
-                    # restored.save(new_input_image)
-                    # success_print(f"new enhanced image saved: {new_input_image}")
-
-                # except ImportError:
-                    # print("DEBUG: realesrgan not installed; skipping super-resolution")
-                # except TypeError as e:
-                    # print(f"DEBUG: RealESRGAN registry error, skipping super-resolution ({e})")
-                # except Exception as e:
-                    # print(f"DEBUG: Unexpected error during RealESRGAN enhancement; skipping ({e})")
-
-
-            # temp_video_path = os.path.join(temp_queue_images, f'1secondtempvideo_{worker_job_name}.mp4')
-            # denoised_result = np.array(new_input_image)
-            # starting_image = create_still_frame_video(next_job, temp_video_path, denoised_result)
-
-
-        # return new_input_image, starting_image
-        
-    # except Exception as e:
-        # alert_print(f"Error in denoising: {str(e)}")
-        # if not high_vram:
-            # unload_complete_models(
-                # text_encoder, text_encoder_2, image_encoder, vae, transformer
-            # ) 
-        # new_input_image = "failed"
-        # starting_image = ""
-        # return new_input_image, starting_image
-
-
 
 @torch.no_grad()
 def worker(worker_job):
-    global transformer, worker_input_image
+    global high_vram, transformer, worker_input_image
     """Worker function to process a job"""
     global stream
     # Create job output and history folders if they don't exist
@@ -3216,23 +3057,23 @@ def worker(worker_job):
     # Save the input image with metadata
     metadata = PngInfo()
     fields = [
-        ("prompt", worker_prompt),
-        ("n_prompt", worker_n_prompt),
-        ("lora_model", str(worker_lora_model)),
-        ("lora_weight", str(worker_lora_weight)),
-        ("video_length", str(worker_video_length)),
-        ("job_name", worker_job_name),
-        ("use_teacache", str(worker_use_teacache)),
+    ("prompt", worker_prompt),
+    ("n_prompt", worker_n_prompt),
+    ("lora_model", str(worker_lora_model)),
+    ("lora_weight", str(worker_lora_weight)),
+    ("video_length", str(worker_video_length)),
+    ("job_name", worker_job_name),
+    ("use_teacache", str(worker_use_teacache)),
         ("seed", str(worker_seed)),
-        ("steps", str(worker_steps)),
-        ("cfg", str(worker_cfg)),
-        ("gs", str(worker_gs)),
-        ("rs", str(worker_rs)),
-        ("image_strength", str(worker_image_strength)),
-        ("mp4_crf", str(worker_mp4_crf)),
-        ("gpu_memory", str(worker_gpu_memory)),
+    ("steps", str(worker_steps)),
+    ("cfg", str(worker_cfg)),
+    ("gs", str(worker_gs)),
+    ("rs", str(worker_rs)),
+    ("image_strength", str(worker_image_strength)),
+    ("mp4_crf", str(worker_mp4_crf)),
+    ("gpu_memory", str(worker_gpu_memory)),
         ("source_name", str(getattr(worker_job, 'source_name', '')))
-    ]
+    ]        
     for key, value in fields:
         metadata.add_text(key, value)
 
@@ -3247,7 +3088,7 @@ def worker(worker_job):
     target_frames = ((worker_video_length * 30) - 1)
     total_latent_sections = max(math.ceil(target_frames / (worker_latent_window_size * 4)), 1)
 
-    
+
     
     # Convert RGBA images to RGB if needed
     if worker_input_image is not None:
@@ -3263,10 +3104,7 @@ def worker(worker_job):
         # send to image to image function, Get the denoised image and update worker_input_image
         new_input_image, starting_image = make_img2img(worker_input_image, worker_job, worker_prompt, worker_cfg, worker_n_prompt, worker_image_strength, worker_job_name, worker_seed, worker_use_teacache, worker_gpu_memory, worker_steps, worker_latent_window_size, worker_gs, worker_rs, worker_mp4_crf)
         
-        worker_prompt = worker_prompt + ", high quality video, focused on subject"
-        worker_n_prompt = worker_n_prompt + ", static, noise, cartoon, grainy, unrealistic"
 
-        
         if new_input_image == "failed":
             e = "Error creating Image2Image"
             timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3300,15 +3138,10 @@ CFG Scaleing:  GS: {worker_gs} - RS: {worker_rs} - CFG: {worker_cfg}<br>
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
         if worker_lora_model and worker_lora_model != "None":
-            
-            state_dict = transformer.state_dict()
             try:
                 lora_model = os.path.join(lora_path, worker_lora_model)
                 info_print(f"Loading LoRA from {lora_model}")
-
-                state_dict = load_lora(state_dict, lora_model, worker_lora_weight, device=gpu)
-                gc.collect()
-
+                transformer.load_state_dict(load_lora(transformer.state_dict(), lora_model, worker_lora_weight, gpu))
                 success_print("LoRA loaded successfully")
             except Exception as e:
                 alert_print(f"Error loading LoRA: {str(e)}")
@@ -3317,7 +3150,7 @@ CFG Scaleing:  GS: {worker_gs} - RS: {worker_rs} - CFG: {worker_cfg}<br>
                 save_queue()
                 unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
                 stream.output_queue.push(('failed', (job_percentage, worker_job)))
-                raise
+                return
 
 
         
@@ -3330,11 +3163,11 @@ CFG Scaleing:  GS: {worker_gs} - RS: {worker_rs} - CFG: {worker_cfg}<br>
 
         llama_vec, clip_l_pooler = encode_prompt_conds(worker_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
-        # if worker_cfg == 1:
         if worker_n_prompt is None or worker_n_prompt == "":
             llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
         else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(worker_n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            n_prompt_str = str(worker_n_prompt) if worker_n_prompt is not None else ""
+            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt_str, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
@@ -3361,7 +3194,6 @@ CFG Scaleing:  GS: {worker_gs} - RS: {worker_rs} - CFG: {worker_cfg}<br>
             debug_print(f"saved input image to {worker_job_history_folder}/{worker_job_name}.png")
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
-
         # VAE encoding
         stream.output_queue.push(('progress', (preview_image, "VAE encoding...", make_progress_bar_html(0, "Step Progress"), job_desc)))
 
@@ -3564,28 +3396,6 @@ CFG Scaleing:  GS: {worker_gs} - RS: {worker_rs} - CFG: {worker_cfg}<br>"""
             unload_complete_models(
                 text_encoder, text_encoder_2, image_encoder, vae, transformer
             )
-    # except Exception as e:
-        # #Capture the traceback as a string
-        # error_text = io.StringIO()
-        # traceback.print_exc(file=error_text)
-        # error_text = error_text.getvalue()
-        # traceback.print_exc()  # Also print to console
-        
-        # if not high_vram:
-            # unload_complete_models(
-                # text_encoder, text_encoder_2, image_encoder, vae, transformer
-            # )
-        # if stream.input_queue.top() not in ['abort', 'abort_delete']:
-            # timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # if hasattr(worker_job, 'error_message') and worker_job.error_message:
-                # worker_job.error_message += f"\n\n[{timestamp}] - {error_text}"
-            # else:
-                # worker_job.error_message = f"[{timestamp}] - {error_text}"
-            # save_queue()
-            # alert_print(f"job updated to include error message: {error_text}")
-            # stream.output_queue.push(('failed', job_percentage, worker_job))
-            # return
-            # raise KeyboardInterrupt('ERRORS OCCURED WITH THE JOB')
     info_print("done if not in ['abort', 'abort_delete', 'failed']")
     # need something here
 
@@ -3989,6 +3799,7 @@ def process():
                     )
 
                     debug_print ("called async_run worker, next_job after a failed job")
+                    load_queue()
 
                     async_run(worker, next_job)
 
@@ -4007,6 +3818,7 @@ def process():
                         update_queue_display(),        # queue_display
                         update_queue_table()         # queue_table
                     )
+                    save_queue()
 
                     stream = None
                     return
@@ -4132,6 +3944,7 @@ def process():
                     )
 
                     debug_print ("called async_run worker, next_job after a completed job")
+                    
 
                     async_run(worker, next_job)
 
@@ -4389,6 +4202,7 @@ def delete_all_jobs():
 
 
 def move_job_to_top(job_name):
+    load_queue()
     """Move a job to the top of the queue, maintaining processing job at top"""
     try:
         # Find the job's current index
@@ -4436,6 +4250,7 @@ def move_job_to_top(job_name):
         # return #update_queue_table(), update_queue_display()
 
 def move_job_to_bottom(job_name):
+    load_queue()
     """Move a job to the bottom of the queue, maintaining completed jobs at bottom"""
     try:
         # Find the job's current index
@@ -4472,6 +4287,7 @@ def move_job_to_bottom(job_name):
         # return #update_queue_table(), update_queue_display()
 
 def move_job(job_name, direction):
+    load_queue()
     """Move a job up or down one position in the queue while maintaining sorting rules"""
     try:
         # Find the job's current index
@@ -4529,6 +4345,7 @@ def move_job(job_name, direction):
         # return #update_queue_table(), update_queue_display()
 
 def remove_job(job_name):
+    load_queue()
     """Delete a job from the queue and its associated files"""
     try:
         # Find and remove job from queue
@@ -4671,6 +4488,7 @@ def generate_new_job_name(old_job_name):
     return f"{prefix}-{new_hex}"
 
 def copy_job(job_name):
+    load_queue()
     """Create a copy of a job and insert it below the original"""
     try:
         # Find the job
@@ -4727,7 +4545,7 @@ def copy_job(job_name):
         queue_table_update, queue_display_update = mark_job_pending(new_job)
         save_queue()
         debug_print(f"Total jobs in the queue:{len(job_queue)}")
-        
+            
     except Exception as e:
         alert_print(f"Error copying job: {str(e)}")
         traceback.print_exc()
@@ -4805,6 +4623,7 @@ def edit_job(
     job_name,change_job_name, prompt, n_prompt, lora_model, lora_weight, video_length, outputs_folder, job_history_folder, use_teacache, seed, steps, cfg, gs, rs, image_strength, mp4_crf, gpu_memory, keep_completed_job, keep_temp_png
 ):
     #Edit a job's parameters
+    load_queue()
     try:
         # Find the job  need to add a gr field next to job_name called new_job_name make  job_name not visable  make new_job_name labled as jon_name visible and interactive
         for job in job_queue:
@@ -4867,6 +4686,7 @@ def edit_job(
 
 def delete_completed_jobs():
     """Delete all completed jobs from the queue"""
+    load_queue()
     global job_queue
     job_queue = [job for job in job_queue if job.status != "completed"]
     save_queue()
@@ -4874,6 +4694,7 @@ def delete_completed_jobs():
     return update_queue_table(), update_queue_display()
 
 def delete_pending_jobs():
+    load_queue()
     """Delete all pending jobs from the queue"""
     global job_queue
     job_queue = [job for job in job_queue if job.status != "pending"]
@@ -4882,6 +4703,7 @@ def delete_pending_jobs():
     return update_queue_table(), update_queue_display()
 
 def delete_failed_jobs():
+    load_queue()
     """Delete all failed jobs from the queue"""
     global job_queue
     job_queue = [job for job in job_queue if job.status != "failed"]
@@ -4890,6 +4712,7 @@ def delete_failed_jobs():
     return update_queue_table(), update_queue_display()
 
 def hide_edit_window():
+    load_queue()
     #Hide the edit window without saving changes
     return (
         gr.update(visible=False),  # edit_job_group
@@ -5836,13 +5659,6 @@ with block:
                     )
                 
                 
-                # with gr.Accordion("LoRA Settings", open=False):
-                    # edit_job_lora_model = gr.Dropdown(label="LoRA Model", choices=lora_choices, value=Config.DEFAULT_LORA_MODEL, info="Select a LoRA .safetensors file to use (or None for no LoRA)")
-                    # edit_job_lora_weight = gr.Slider(label="LoRA Strength", minimum=0, maximum=2.0, value=Config.DEFAULT_LORA_WEIGHT, step=0.1)
-                    
-                    
-                    
-                    
                 gr.Markdown("<br>")
                 with gr.Accordion("Job Settings", open=False):
                     edit_job_use_teacache = gr.Checkbox(label='Change Use TeaCache', value=True)
